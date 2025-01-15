@@ -1,144 +1,238 @@
 import pandas as pd
 import streamlit as st
-from pulp import LpMaximize, LpProblem, LpVariable, lpSum, LpStatus
+from pulp import LpMaximize, LpProblem, LpVariable, lpSum, LpStatus, PULP_CBC_CMD
 import numpy as np
+import matplotlib.pyplot as plt
 
-def load_data():
+
+# ----------------------------
+# Data Loading
+# ----------------------------
+def load_data(file_name="player_data.csv"):
     """
-    Load player data from a CSV file in the same directory.
+    Load player data from a CSV file and return a list of dictionaries.
     """
-    file_name = "player_data.csv"  # Hardcoded filename
     return pd.read_csv(file_name).to_dict("records")
 
-def optimize_lineup(players, lineup_size, min_salary, max_salary, excluded_players=[]):
+
+# ----------------------------
+# Optimization Function with Uniqueness Constraints
+# ----------------------------
+def optimize_lineup(players, min_salary, max_salary, 
+                    prev_lineup_sets=None, min_unique=None, 
+                    extra_exclusions=[]):
     """
-    Optimize a single lineup while excluding specific players and respecting salary constraints.
+    Solve the lineup optimization problem with salary constraints and,
+    if provided, uniqueness constraints relative to previously generated lineups.
+    
+    Args:
+        players: list of player dictionaries.
+        min_salary: minimum total salary allowed.
+        max_salary: maximum total salary allowed.
+        prev_lineup_sets: list of sets, where each set contains the names of players 
+                          from a previously generated lineup.
+        min_unique: minimum number of different players compared to any previous lineup.
+        extra_exclusions: list of players to exclude outright.
+        
+    Returns:
+        A list of player dictionaries representing the lineup; or None if no 
+        optimal solution is found.
     """
+    # Initialize the optimization problem
     problem = LpProblem("Tennis_Lineup_Optimization", LpMaximize)
-
-    # Decision variables for each player (1 if selected, 0 otherwise)
+    
+    # Create a decision variable for each player (1 if selected, 0 otherwise)
     player_vars = {player["Player"]: LpVariable(player["Player"], cat="Binary") for player in players}
-
-    # Objective: Maximize total projected points
+    
+    # Objective: maximize total projected points
     problem += lpSum(player_vars[player["Player"]] * player["Pts"] for player in players), "Total_Points"
-
-    # Constraints
-    # Total salary within min and max
+    
+    # Salary constraints
     problem += lpSum(player_vars[player["Player"]] * player["Salary"] for player in players) >= min_salary, "Min_Salary"
     problem += lpSum(player_vars[player["Player"]] * player["Salary"] for player in players) <= max_salary, "Max_Salary"
-
-    # Exactly `lineup_size` players must be selected
-    problem += lpSum(player_vars[player["Player"]] for player in players) == lineup_size, "Lineup_Size"
-
-    # Exclude specified players
-    for excluded_player in excluded_players:
-        problem += player_vars[excluded_player] == 0
-
+    
+    # Exactly 6 players must be selected
+    problem += lpSum(player_vars[player["Player"]] for player in players) == 6, "Lineup_Size"
+    
+    # Exclude additional players as necessary
+    for excl in extra_exclusions:
+        if excl in player_vars:
+            problem += player_vars[excl] == 0, f"Exclude_{excl}"
+    
+    # Uniqueness constraints: for each previous lineup, force the new lineup to have at least min_unique players different.
+    # Equivalently, the overlap between the new lineup and any previous lineup must be <= (6 - min_unique).
+    if prev_lineup_sets and min_unique is not None:
+        for idx, prev_set in enumerate(prev_lineup_sets):
+            relevant_vars = [player_vars[p] for p in prev_set if p in player_vars]
+            # Constraint: sum of overlapping players <= (6 - min_unique)
+            problem += lpSum(relevant_vars) <= 6 - min_unique, f"Unique_constraint_{idx}"
+    
     # Solve the optimization problem
-    problem.solve()
-
+    problem.solve(PULP_CBC_CMD(msg=0))
+    
     if LpStatus[problem.status] != "Optimal":
         return None
-
-    # Extract the optimal lineup
     return [player for player in players if player_vars[player["Player"]].value() == 1]
 
-def generate_hybrid_lineups(players, lineup_size, min_salary, max_salary, num_lineups, unique_constraint):
+
+# ----------------------------
+# Lineup Generation Function
+# ----------------------------
+def generate_lineups(players, min_salary, max_salary, num_lineups, min_unique):
     """
-    Generate lineups using a hybrid of Weighted and Randomized exclusions with looser constraints.
+    Generate a number of lineups meeting salary constraints and ensuring that each new lineup
+    is sufficiently unique relative to every previously generated lineup.
+    
+    Args:
+        players: list of player dictionaries.
+        min_salary: minimum total salary.
+        max_salary: maximum total salary.
+        num_lineups: number of lineups to generate.
+        min_unique: minimum number of unique players compared to any previous lineup.
+    
+    Returns:
+        List of valid lineups (each lineup is a list of player dictionaries).
     """
     lineups = []
-    player_usage = {player["Player"]: 0 for player in players}
-    max_retries = 5  # Maximum number of retries for loosening constraints
-
+    prev_lineup_sets = []  # We'll store frozensets of player names for each lineup
+    
     for i in range(num_lineups):
-        excluded_players = []
-
-        # Hybrid Exclusion Logic:
-        # 1. Exclude players used in 3-4 consecutive lineups for the next 1-2 lineups
-        for player, usage in player_usage.items():
-            if usage >= 3:
-                excluded_players.append(player)
-
-        # 2. Randomly exclude additional players to enforce uniqueness
-        if len(lineups) > 0:
-            all_players_in_lineups = {p["Player"] for lineup in lineups for p in lineup}
-            excluded_players += list(
-                np.random.choice(list(all_players_in_lineups), size=min(unique_constraint, len(all_players_in_lineups)), replace=False)
-            )
-
-        # Generate a new lineup with retries for loosening constraints
-        retries = 0
-        lineup = None
-        while lineup is None and retries < max_retries:
-            lineup = optimize_lineup(players, lineup_size, min_salary, max_salary, excluded_players)
-            if lineup is None:
-                retries += 1
-                unique_constraint = max(0, unique_constraint - 1)  # Loosen uniqueness constraint
-
-        if lineup is None:  # Stop if no valid lineup can be generated
+        candidate = optimize_lineup(
+            players,
+            min_salary,
+            max_salary,
+            prev_lineup_sets=prev_lineup_sets,
+            min_unique=min_unique,
+            extra_exclusions=[]
+        )
+        if candidate is None:
+            # If we cannot generate a candidate given the constraints, break out.
             break
-
-        lineups.append(lineup)
-        for player in lineup:
-            player_usage[player["Player"]] += 1
-
+        lineups.append(candidate)
+        candidate_set = frozenset(player["Player"] for player in candidate)
+        prev_lineup_sets.append(candidate_set)
     return lineups
 
+
+# ----------------------------
+# Metrics and Exposure Calculation
+# ----------------------------
 def calculate_metrics(lineups):
     """
-    Calculate the top, bottom, and median projected lineups.
+    Compute metrics (total salary and total projected points) for the top, bottom, and median lineups.
+    
+    Returns:
+        Three tuples: (Total Salary, Total Projected Points) for top, bottom, and median lineups.
     """
     lineup_points = [sum(player["Pts"] for player in lineup) for lineup in lineups]
-    lineup_points.sort()
-
-    # Top projected lineup
+    lineup_points_sorted = sorted(lineup_points)
+    
     top_lineup = max(lineups, key=lambda lineup: sum(player["Pts"] for player in lineup))
+    bottom_lineup = min(lineups, key=lambda lineup: sum(player["Pts"] for player in lineup))
+    median_val = lineup_points_sorted[len(lineup_points_sorted) // 2]
+    median_lineup = next(lineup for lineup in lineups if sum(player["Pts"] for player in lineup) == median_val)
+    
     top_salary = sum(player["Salary"] for player in top_lineup)
     top_points = sum(player["Pts"] for player in top_lineup)
-
-    # Bottom projected lineup
-    bottom_lineup = min(lineups, key=lambda lineup: sum(player["Pts"] for player in lineup))
     bottom_salary = sum(player["Salary"] for player in bottom_lineup)
     bottom_points = sum(player["Pts"] for player in bottom_lineup)
-
-    # Median projected lineup
-    median_index = len(lineup_points) // 2
-    median_lineup = next(lineup for lineup in lineups if sum(player["Pts"] for player in lineup) == lineup_points[median_index])
     median_salary = sum(player["Salary"] for player in median_lineup)
     median_points = sum(player["Pts"] for player in median_lineup)
-
+    
     return (top_salary, top_points), (bottom_salary, bottom_points), (median_salary, median_points)
 
-def display_metrics(top, bottom, median):
+
+def calculate_exposures(lineups, total_lineups):
     """
-    Display the salary used and total lineup projection for top, bottom, and median lineups.
+    Calculate each player's exposure (in percent) over all generated lineups.
     """
-    st.write("### Lineup Metrics:")
-    st.write(f"**Top Projected Lineup**: Salary = ${top[0]}, Points = {top[1]:.2f}")
-    st.write(f"**Bottom Projected Lineup**: Salary = ${bottom[0]}, Points = {bottom[1]:.2f}")
-    st.write(f"**Median Projected Lineup**: Salary = ${median[0]}, Points = {median[1]:.2f}")
+    player_counts = {}
+    for lineup in lineups:
+        for player in lineup:
+            player_counts[player["Player"]] = player_counts.get(player["Player"], 0) + 1
 
-# Streamlit app
-st.title("Hybrid Tennis Lineup Generator")
+    exposures = [
+        {"Player": player, "Exposure (%)": (count / total_lineups) * 100}
+        for player, count in sorted(player_counts.items(), key=lambda x: x[1], reverse=True)
+    ]
+    return pd.DataFrame(exposures)
 
-# Load data from the local file
-players = load_data()
 
-# User inputs
-lineup_size = st.number_input("Number of Players per Lineup", value=6, step=1, min_value=1)
-num_lineups = st.number_input("Number of Lineups to Generate", value=20, step=1, min_value=1)
-unique_constraint = st.number_input("Number of Unique Players Between Lineups", value=3, step=1, min_value=0)
-min_salary = st.number_input("Minimum Salary Cap", value=49000, step=500)
-max_salary = st.number_input("Maximum Salary Cap", value=50000, step=500)
+def count_unique_players(lineups):
+    """
+    Count the total unique players used across all lineups.
+    """
+    unique_players = {player["Player"] for lineup in lineups for player in lineup}
+    return len(unique_players)
 
-if st.button("Generate Lineups"):
-    lineups = generate_hybrid_lineups(players, lineup_size, min_salary, max_salary, num_lineups, unique_constraint)
 
-    if lineups:
-        st.success(f"Generated {len(lineups)} lineups using the Hybrid Exclusion Strategy!")
-        top, bottom, median = calculate_metrics(lineups)
-        display_metrics(top, bottom, median)
-    else:
-        st.error("Could not generate any valid lineups. Adjust your constraints and try again.")
+# ----------------------------
+# Visualization Functions
+# ----------------------------
+def plot_lineup_scatter(lineups):
+    """
+    Plot a scatter graph of lineup number versus total projected points.
+    """
+    lineup_numbers = list(range(1, len(lineups) + 1))
+    lineup_points = [sum(player["Pts"] for player in lineup) for lineup in lineups]
+    
+    plt.figure(figsize=(10, 6))
+    plt.scatter(lineup_numbers, lineup_points, alpha=0.7, c='blue')
+    plt.title("Lineup Projected Points by Lineup Number")
+    plt.xlabel("Lineup Number")
+    plt.ylabel("Total Projected Points")
+    plt.grid(True)
+    st.pyplot(plt)
+
+
+# ----------------------------
+# Streamlit App Main Function
+# ----------------------------
+def main():
+    st.set_page_config(page_title="Tennis Lineup Optimizer", layout="wide")
+    st.title("Tennis Lineup Optimizer with Uniqueness Constraints")
+    
+    # Sidebar settings
+    st.sidebar.header("Settings")
+    players = load_data()  # Ensure player_data.csv is available
+    
+    num_lineups = st.sidebar.slider("Number of Lineups", min_value=1, max_value=50, value=20)
+    min_salary = st.sidebar.slider("Minimum Salary Cap", min_value=40000, max_value=50000, value=49000, step=500)
+    max_salary = st.sidebar.slider("Maximum Salary Cap", min_value=40000, max_value=50000, value=50000, step=500)
+    min_unique = st.sidebar.slider("Minimum Unique Players per Lineup", min_value=1, max_value=6, value=3,
+                                   help=("Each new lineup will have at least this many players different than any previous lineup. "
+                                         "For example, with 3 unique players, any two lineups can share at most 3 players."))
+    
+    if st.sidebar.button("Generate Lineups"):
+        lineups = generate_lineups(players, min_salary, max_salary, num_lineups, min_unique)
+        
+        if lineups:
+            st.success(f"Generated {len(lineups)} unique lineups!")
+            
+            # Display metrics
+            top, bottom, median = calculate_metrics(lineups)
+            st.write("### Lineup Metrics")
+            st.write(f"**Top Projected Lineup:** Salary = ${top[0]}, Points = {top[1]:.2f}")
+            st.write(f"**Bottom Projected Lineup:** Salary = ${bottom[0]}, Points = {bottom[1]:.2f}")
+            st.write(f"**Median Projected Lineup:** Salary = ${median[0]}, Points = {median[1]:.2f}")
+            
+            # Unique players count
+            unique_players_count = count_unique_players(lineups)
+            st.write(f"### Total Unique Players Used: {unique_players_count}")
+            
+            # Scatterplot
+            st.write("### Lineup Strength Scatterplot")
+            plot_lineup_scatter(lineups)
+            
+            # Player exposures
+            exposures = calculate_exposures(lineups, len(lineups))
+            st.write("### Player Exposures")
+            st.dataframe(exposures)
+        else:
+            st.error("Could not generate valid lineups under the current constraints. "
+                     "Try lowering the uniqueness requirement or adjusting salary constraints.")
+
+            
+if __name__ == "__main__":
+    main()
 
