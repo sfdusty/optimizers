@@ -1,3 +1,5 @@
+#this is a mixed integer/linear programming optimizer
+
 import pandas as pd
 import streamlit as st
 from pulp import LpMaximize, LpProblem, LpVariable, lpSum, LpStatus, PULP_CBC_CMD
