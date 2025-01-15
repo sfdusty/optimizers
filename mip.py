@@ -1,5 +1,3 @@
-#this is a mixed integer/linear programming optimizer
-
 import pandas as pd
 import streamlit as st
 from pulp import LpMaximize, LpProblem, LpVariable, lpSum, LpStatus, PULP_CBC_CMD
@@ -62,12 +60,16 @@ def optimize_lineup(players, min_salary, max_salary,
             problem += player_vars[excl] == 0, f"Exclude_{excl}"
     
     # Uniqueness constraints: for each previous lineup, force the new lineup to have at least min_unique players different.
-    # Equivalently, the overlap between the new lineup and any previous lineup must be <= (6 - min_unique).
     if prev_lineup_sets and min_unique is not None:
         for idx, prev_set in enumerate(prev_lineup_sets):
             relevant_vars = [player_vars[p] for p in prev_set if p in player_vars]
-            # Constraint: sum of overlapping players <= (6 - min_unique)
             problem += lpSum(relevant_vars) <= 6 - min_unique, f"Unique_constraint_{idx}"
+    
+    # Match constraints: Prevent both a player and their opponent from being in the same lineup
+    match_dict = {player["Player"]: player["Opponent"] for player in players}
+    for player, opponent in match_dict.items():
+        if player in player_vars and opponent in player_vars:
+            problem += player_vars[player] + player_vars[opponent] <= 1, f"Match_constraint_{player}_{opponent}"
     
     # Solve the optimization problem
     problem.solve(PULP_CBC_CMD(msg=0))
@@ -75,7 +77,6 @@ def optimize_lineup(players, min_salary, max_salary,
     if LpStatus[problem.status] != "Optimal":
         return None
     return [player for player in players if player_vars[player["Player"]].value() == 1]
-
 
 # ----------------------------
 # Lineup Generation Function
@@ -237,4 +238,3 @@ def main():
             
 if __name__ == "__main__":
     main()
-
